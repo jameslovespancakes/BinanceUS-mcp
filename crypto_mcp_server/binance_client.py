@@ -96,30 +96,65 @@ class BinanceUSClient:
             logger.error(f"Error fetching price for {symbol}: {e}")
             raise
 
-    def _format_quantity(self, symbol: str, quantity: float) -> float:
+    def _format_quantity(self, symbol: str, quantity: float) -> str:
         """Format quantity according to symbol's LOT_SIZE filter"""
         try:
             info = self.client.get_symbol_info(symbol)
+
+            # Extract filters
+            lot_size_filter = None
+            min_notional_filter = None
+
             for filter_item in info['filters']:
                 if filter_item['filterType'] == 'LOT_SIZE':
-                    step_size = float(filter_item['stepSize'])
-                    min_qty = float(filter_item['minQty'])
-                    max_qty = float(filter_item['maxQty'])
+                    lot_size_filter = filter_item
+                elif filter_item['filterType'] == 'MIN_NOTIONAL':
+                    min_notional_filter = filter_item
 
-                    # Round to step_size precision
-                    precision = len(str(step_size).rstrip('0').split('.')[-1])
-                    formatted_qty = round(quantity - (quantity % step_size), precision)
+            if not lot_size_filter:
+                logger.warning(f"No LOT_SIZE filter found for {symbol}, using quantity as-is")
+                return f"{quantity:.8f}".rstrip('0').rstrip('.')
 
-                    # Validate bounds
-                    if formatted_qty < min_qty:
-                        raise ValueError(f"Quantity {formatted_qty} below minimum {min_qty}")
-                    if formatted_qty > max_qty:
-                        raise ValueError(f"Quantity {formatted_qty} above maximum {max_qty}")
+            step_size = float(lot_size_filter['stepSize'])
+            min_qty = float(lot_size_filter['minQty'])
+            max_qty = float(lot_size_filter['maxQty'])
 
-                    return formatted_qty
+            # Calculate precision from step_size
+            step_str = f"{step_size:.8f}".rstrip('0')
+            if '.' in step_str:
+                precision = len(step_str.split('.')[-1])
+            else:
+                precision = 0
 
-            # No LOT_SIZE filter found, return original
-            return quantity
+            # Round down to step_size precision
+            formatted_qty = quantity - (quantity % step_size)
+            formatted_qty = round(formatted_qty, precision)
+
+            # Validate bounds
+            if formatted_qty < min_qty:
+                raise ValueError(f"Quantity {formatted_qty} below minimum {min_qty} for {symbol}")
+            if formatted_qty > max_qty:
+                raise ValueError(f"Quantity {formatted_qty} above maximum {max_qty} for {symbol}")
+
+            # Format as string to avoid scientific notation
+            qty_str = f"{formatted_qty:.{precision}f}".rstrip('0').rstrip('.')
+
+            # Validate MIN_NOTIONAL if filter exists
+            if min_notional_filter:
+                min_notional = float(min_notional_filter.get('minNotional', 0))
+                # Get current price to check notional value
+                ticker = self.client.get_symbol_ticker(symbol=symbol)
+                current_price = float(ticker['price'])
+                notional_value = formatted_qty * current_price
+
+                if notional_value < min_notional:
+                    raise ValueError(
+                        f"Order value ${notional_value:.2f} below minimum ${min_notional:.2f} for {symbol}. "
+                        f"Increase quantity or trade a different amount."
+                    )
+
+            return qty_str
+
         except Exception as e:
             logger.error(f"Error formatting quantity for {symbol}: {e}")
             raise
@@ -824,6 +859,136 @@ class BinanceUSClient:
             }
         except Exception as e:
             logger.error(f"Error getting symbol info for {symbol}: {e}")
+            raise
+
+    async def convert_dust_to_bnb(self, assets: Optional[List[str]] = None) -> Dict:
+        """
+        Convert small balances (dust) to BNB using Binance's dust conversion feature.
+
+        Args:
+            assets: List of asset symbols to convert (e.g., ['BTC', 'ETH']).
+                   If None, will attempt to convert all dust balances.
+
+        Returns:
+            Dict with conversion results and details
+        """
+        try:
+            # If no assets specified, get all dust balances
+            if assets is None:
+                balances = await self.get_account_balances()
+                # Get current prices to calculate notional values
+                dust_threshold_usd = 10  # Typical dust threshold
+
+                dust_assets = []
+                for balance in balances:
+                    if balance.asset in ['BNB', 'USDT', 'USDC', 'BUSD']:
+                        continue  # Skip stablecoins and BNB
+
+                    # Try to get price in USDT
+                    try:
+                        symbol = f"{balance.asset}USDT"
+                        price = await self.get_current_price(symbol)
+                        notional = balance.free * price
+
+                        if 0 < notional < dust_threshold_usd:
+                            dust_assets.append(balance.asset)
+                    except:
+                        # If can't get price, include if balance is very small
+                        if 0 < balance.free < 1:
+                            dust_assets.append(balance.asset)
+
+                assets = dust_assets
+
+            if not assets:
+                return {
+                    'success': True,
+                    'message': 'No dust balances found to convert',
+                    'converted_assets': [],
+                    'bnb_received': 0
+                }
+
+            # Convert dust using Binance API
+            result = self.client.transfer_dust(asset=assets)
+
+            logger.info(f"Dust conversion completed: {result}")
+
+            return {
+                'success': True,
+                'message': f"Successfully converted {len(assets)} dust positions to BNB",
+                'converted_assets': assets,
+                'transfer_result': result.get('transferResult', []),
+                'total_transferred': result.get('totalTransfered', 0),
+                'total_service_charge': result.get('totalServiceCharge', 0)
+            }
+
+        except Exception as e:
+            logger.error(f"Error converting dust: {e}")
+            return {
+                'success': False,
+                'message': f"Failed to convert dust: {str(e)}",
+                'converted_assets': [],
+                'error': str(e)
+            }
+
+    async def get_dust_balances(self) -> Dict:
+        """
+        Identify all dust balances (positions too small to sell normally).
+
+        Returns:
+            Dict with dust balances and total USD value
+        """
+        try:
+            balances = await self.get_account_balances()
+            dust_positions = []
+            total_dust_value_usd = 0
+            dust_threshold_usd = 10
+
+            for balance in balances:
+                if balance.asset in ['BNB', 'USDT', 'USDC', 'BUSD']:
+                    continue
+
+                try:
+                    # Try to get value in USDT
+                    symbol = f"{balance.asset}USDT"
+                    price = await self.get_current_price(symbol)
+                    notional = balance.free * price
+
+                    # Check if below dust threshold
+                    if 0 < notional < dust_threshold_usd:
+                        dust_positions.append({
+                            'asset': balance.asset,
+                            'quantity': balance.free,
+                            'locked': balance.locked,
+                            'price_usdt': price,
+                            'value_usdt': notional,
+                            'can_convert': True
+                        })
+                        total_dust_value_usd += notional
+
+                except Exception as symbol_error:
+                    # Asset might not have USDT pair or other issue
+                    if balance.free > 0:
+                        dust_positions.append({
+                            'asset': balance.asset,
+                            'quantity': balance.free,
+                            'locked': balance.locked,
+                            'price_usdt': None,
+                            'value_usdt': None,
+                            'can_convert': True,
+                            'note': 'Price unavailable'
+                        })
+
+            return {
+                'dust_positions': dust_positions,
+                'total_count': len(dust_positions),
+                'total_value_usdt': total_dust_value_usd,
+                'dust_threshold_usdt': dust_threshold_usd,
+                'recommendation': 'Convert to BNB using convert_dust_to_bnb()' if dust_positions else 'No dust found',
+                'timestamp': datetime.utcnow()
+            }
+
+        except Exception as e:
+            logger.error(f"Error getting dust balances: {e}")
             raise
 
     async def get_enhanced_candlestick_data(self, symbol: str, timeframe: str = "1h", limit: int = 100) -> Dict:

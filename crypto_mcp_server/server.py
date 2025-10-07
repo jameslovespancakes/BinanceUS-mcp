@@ -309,6 +309,20 @@ async def list_tools() -> list[Tool]:
                 },
                 "required": ["symbol"]
             }
+        ),
+        Tool(
+            name="convert_dust_to_bnb",
+            description="Convert small 'dust' balances to BNB using Binance's dust conversion feature. This is the only way to clear positions that are below minimum trading thresholds (MIN_NOTIONAL errors). Automatically identifies and converts dust positions, or you can specify which assets to convert.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "assets": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of asset symbols to convert (e.g., ['BTC', 'ETH', 'LINK', 'SOL']). Leave empty to auto-convert all dust positions."
+                    }
+                }
+            }
         )
     ]
 
@@ -836,6 +850,39 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
             result += f"\n🎯 PRECISION:\n"
             result += f"  Base Asset Precision: {details['base_asset_precision']}\n"
             result += f"  Quote Precision: {details['quote_asset_precision']}\n"
+
+            return [TextContent(type="text", text=result)]
+
+        elif name == "convert_dust_to_bnb":
+            assets = arguments.get("assets")
+
+            logger.info(f"Converting dust to BNB: {assets if assets else 'all dust'}")
+            conversion_result = await binance_client.convert_dust_to_bnb(assets=assets)
+
+            result = f"🧹 Dust Conversion Result:\n\n"
+
+            if conversion_result['success']:
+                result += f"✅ {conversion_result['message']}\n\n"
+
+                if conversion_result['converted_assets']:
+                    result += f"Converted Assets: {', '.join(conversion_result['converted_assets'])}\n"
+
+                    if conversion_result.get('transfer_result'):
+                        result += "\n📊 Transfer Details:\n"
+                        for transfer in conversion_result['transfer_result']:
+                            result += f"  • {transfer.get('fromAsset', 'Asset')}: "
+                            result += f"{transfer.get('amount', 0)} → {transfer.get('tranId', 'N/A')}\n"
+
+                    if conversion_result.get('total_transferred'):
+                        result += f"\nTotal BNB Received: {conversion_result['total_transferred']}\n"
+                    if conversion_result.get('total_service_charge'):
+                        result += f"Service Charge: {conversion_result['total_service_charge']}\n"
+                else:
+                    result += "No assets were converted.\n"
+            else:
+                result += f"❌ {conversion_result['message']}\n"
+                if conversion_result.get('error'):
+                    result += f"\nError Details: {conversion_result['error']}\n"
 
             return [TextContent(type="text", text=result)]
 
