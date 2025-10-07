@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pytest:*)",
+      "Bash(python -m pytest -v)",
+      "Bash(python -m pytest -v --tb=line)",
+      "Bash(python -m pytest -v --tb=short)",
+      "Bash(python -m pytest tests/ -v --tb=short)",
+      "Bash(pip install:*)",
+      "Bash(python:*)",
+      "Bash(dir)",
+      "Bash(git init:*)",
+      "Bash(git branch:*)",
+      "Bash(git add:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
